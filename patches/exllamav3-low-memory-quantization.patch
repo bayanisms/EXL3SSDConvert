@@ -1,0 +1,133 @@
+diff --git a/exllamav3/modules/quant/exl3_lib/quantize.py b/exllamav3/modules/quant/exl3_lib/quantize.py
+index 70e5cb4..a123bdd 100644
+--- a/exllamav3/modules/quant/exl3_lib/quantize.py
++++ b/exllamav3/modules/quant/exl3_lib/quantize.py
+@@ -2,6 +2,7 @@ import torch
+ import torch.nn.functional as F
+ import math
+ import os
++import tempfile
+ from ....ext import exllamav3_ext as ext
+ from ....util.progress import ProgressBar
+ from ....util.memory import free_mem, list_gpu_tensors
+@@ -18,6 +19,38 @@ codebook_scale = 1.24371088
+ codebook_mcg_mult = 0xCBAC1FED
+ codebook_mul1_mult = 0x83DCD12D
+ 
++
++def _mmap_zeros(shape, dtype, directory):
++    """Create an unlinked, file-backed CPU tensor initialized to zero."""
++    os.makedirs(directory, exist_ok = True)
++    numel = math.prod(shape)
++    element_size = torch.empty((), dtype = dtype).element_size()
++    fd, path = tempfile.mkstemp(prefix = "exl3-quant-", suffix = ".mmap", dir = directory)
++    try:
++        os.ftruncate(fd, numel * element_size)
++    finally:
++        os.close(fd)
++    try:
++        tensor = torch.from_file(path, shared = True, size = numel, dtype = dtype).view(shape)
++        os.unlink(path)
++        return tensor
++    except BaseException:
++        try:
++            os.unlink(path)
++        except FileNotFoundError:
++            pass
++        raise
++
++
++def _large_cpu_zeros(shape, dtype, device):
++    """Use reclaimable file-backed storage for large conversion buffers when requested."""
++    directory = os.environ.get("EXL3_QUANT_MMAP_DIR")
++    threshold = int(os.environ.get("EXL3_QUANT_MMAP_THRESHOLD", str(1 << 30)))
++    nbytes = math.prod(shape) * torch.empty((), dtype = dtype).element_size()
++    if directory and torch.device(device).type == "cpu" and nbytes >= threshold:
++        return _mmap_zeros(shape, dtype, directory)
++    return torch.zeros(shape, dtype = dtype, device = device)
++
+ @lru_cache
+ def tensor_core_perm(device):
+     """
+@@ -545,8 +578,8 @@ def ldlq(
+ 
+         # Work buffers
+         prod_cache = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
+-        weight_q = torch.zeros((size_k, size_n), dtype = torch.float, device = buffer_device)
+-        encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
++        weight_q = _large_cpu_zeros((size_k, size_n), torch.float, buffer_device)
++        encoded = _large_cpu_zeros((tiles_k, tiles_n, 256), torch.short, buffer_device)
+ 
+         for j in range(size_k, 0, -buf_size_k):
+             i = j - buf_size_k
+@@ -665,8 +698,8 @@ def fallback_quant(
+         p_row = 0
+ 
+         # Work buffers
+-        weight_q = torch.zeros((size_k, size_n), dtype = torch.float, device = buffer_device)
+-        encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
++        weight_q = _large_cpu_zeros((size_k, size_n), torch.float, buffer_device)
++        encoded = _large_cpu_zeros((tiles_k, tiles_n, 256), torch.short, buffer_device)
+ 
+         # Accumulate sum of squared error on-device to avoid per-block CPU syncs
+         mse_sum = torch.zeros((), dtype=torch.float64, device=device)
+@@ -743,6 +776,21 @@ def block_trace(A, B, block_size = 1024):
+     return total
+ 
+ 
++def block_trace_pair_stream(weight, weight_q, H, device, col_block = 8192):
++    """Compute proxy-error numerator/denominator without materializing a full error tensor."""
++    num = 0.0
++    den = 0.0
++    for start in range(0, weight.shape[1], col_block):
++        end = min(start + col_block, weight.shape[1])
++        W = weight[:, start:end].to(device)
++        Q = weight_q[:, start:end].to(device)
++        E = W - Q
++        num += block_trace(E, H)
++        den += block_trace(W, H)
++        del E, Q, W
++    return num, den
++
++
+ def ldlq_batched(
+     weights: torch.Tensor,
+     Ls: torch.Tensor,
+@@ -1370,16 +1418,28 @@ def quantize_exl3(
+         # Metrics
+         if not q_fallback:
+             try:
+-                E = weight_r - weight_q  # may run on CPU
+-                W = weight_r
+                 Hd = H.to(device)
+-                weight_r = None
+-                E = E.to(device)
+-                num = block_trace(E, Hd)
+-                E = None
+-                W = W.to(device)
+-                den = block_trace(W, Hd)
+-                W = None
++                low_mem_metrics = (
++                    bool(os.environ.get("EXL3_QUANT_MMAP_DIR")) and
++                    weight_r.device.type == "cpu" and
++                    weight_r.numel() * weight_r.element_size() >=
++                    int(os.environ.get("EXL3_QUANT_MMAP_THRESHOLD", str(1 << 30)))
++                )
++                if low_mem_metrics:
++                    num, den = block_trace_pair_stream(weight_r, weight_q, Hd, device)
++                    weight_r = None
++                    E = None
++                    W = None
++                else:
++                    E = weight_r - weight_q  # may run on CPU
++                    W = weight_r
++                    weight_r = None
++                    E = E.to(device)
++                    num = block_trace(E, Hd)
++                    E = None
++                    W = W.to(device)
++                    den = block_trace(W, Hd)
++                    W = None
+                 Hd = None
+                 proxy_err = num / max(den, 1e-8)
+             except torch.OutOfMemoryError:
