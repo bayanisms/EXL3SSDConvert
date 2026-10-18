@@ -16,7 +16,7 @@ Usage:
 Converts a model to EXL3 with disk-backed large temporary buffers. The source,
 work, and output paths must not overlap; WORK_DIR and OUTPUT_DIR must not exist.
 
-The ExLlamaV3 checkout is inferred as the parent of github/, or set it with
+The ExLlamaV3 checkout defaults to this repository's parent, or set it with
 EXLLAMAV3_ROOT. Optional environment variables:
   PYTHON_BIN, DEVICES, LOG_PATH, EXITCODE_PATH
   HEAD_BITS, MTP_BITS, VISION_BITS (optional converter overrides)

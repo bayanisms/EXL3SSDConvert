@@ -1,55 +1,159 @@
-# Low-memory EXL3 model conversion
+# EXL3SSDConvert
 
-## Goal
+Convert Hugging Face models to **EXL3** with lower host-memory pressure during
+quantization. EXL3SSDConvert combines a small
+[ExLlamaV3](https://github.com/turboderp-org/exllamav3) patch, a conversion
+wrapper, and an inference check.
 
-Convert models to EXL3 when the source model or conversion intermediates do not fit in GPU memory. The wrapper combines ExLlamaV3 conversion with disk-backed large temporary buffers, host-memory limits, explicit quantization settings, conversion-result checks, and a fresh-process runtime probe.
+Large CPU work buffers can use fast disk-backed storage, and quantization-error
+measurement runs in chunks. This trades disk space and I/O for lower host RAM
+pressure. You still need enough GPU memory for the converter's active workload;
+a successful conversion does not guarantee the finished model will fit for
+inference.
 
-This is a general workflow. Recipes remain model-specific because they map exact tensor names to bitrates. The included custom Qwen 3.8 27B model is an example, not the project identity.
+[Setup](#setup) · [Convert](#convert-a-model) · [Validate](#validate-the-result) ·
+[Settings](#conversion-settings) · [Recipes](#example-recipes) ·
+[Troubleshooting](#troubleshooting) · [Contributing](#development-and-contributing)
 
-## What this adds
+## What is included?
 
-- `patches/exllamav3-low-memory-quantization.patch` moves unusually large CPU conversion buffers to unlinked, disk-backed mmap storage and streams proxy-error measurement instead of materializing another full error tensor.
-- `scripts/convert_model_exl3_low_memory.sh` validates inputs, exposes conversion settings through environment variables, logs resource use, and rejects false-success or incomplete output.
-- `tools/exl3_fit_probe.py` tests model loading, cache allocation, prefill, decode, and GPU memory in a fresh process.
-- `examples/` keeps model-specific recipes, checksums, and measured results separate from the general tooling.
+| Component | Purpose |
+|---|---|
+| [Low-memory patch](patches/exllamav3-low-memory-quantization.patch) | Disk-backed large CPU buffers and streamed proxy-error measurement |
+| [Conversion wrapper](scripts/convert_model_exl3_low_memory.sh) | Input checks, converter verification, resource logging, and output validation |
+| [Fit probe](tools/exl3_fit_probe.py) | Model loading, cache allocation, prefill, decode, and GPU memory reporting |
+| [Example recipes](examples/custom-qwen-3.8-27b/recipes/) | Two model-specific per-tensor bitrate configurations |
+| [Tests](tests/) | Helper tests and environment-dependent integration checks |
 
-The low-memory path changes storage, not the requested quantization precision.
+The patch changes temporary storage and error measurement, not the requested
+quantization bitrate. It targets one upstream revision; this repository does
+not bundle model weights or install ExLlamaV3 automatically.
 
 ## Requirements
 
-- Linux and an NVIDIA CUDA environment supported by ExLlamaV3.
-- An ExLlamaV3 checkout at commit `be57335b087e4f001c5caae061544df3c06ba01e`.
-- ExLlamaV3 installed from that checkout, including its `pyyaml` dependency.
-- A local source model and a per-tensor EXL3 recipe compatible with that model.
-- Fast storage with enough space for the temporary work tree and mmap buffers.
+- **Conversion host:** Linux, NVIDIA GPU, Git, Bash 4+, GNU coreutils
+  (`realpath`, `tee`, `cmp`), and GNU time at `/usr/bin/time`.
+- **Python environment:** Python 3.10.11+, PyTorch 2.6+ with CUDA support, and
+  ExLlamaV3 built from the pinned source below. See the
+  [pinned upstream installation instructions](https://github.com/turboderp-org/exllamav3/blob/be57335b087e4f001c5caae061544df3c06ba01e/README.md#installation)
+  for CUDA and compiler requirements.
+- **Source model:** A local, unquantized Hugging Face model directory with
+  `config.json`, tokenizer files, and safetensors weights. The architecture must
+  be supported by the pinned ExLlamaV3 revision.
+- **Recipe:** A per-tensor EXL3 YAML recipe made for that source model.
+- **Storage and RAM:** Fast local storage for the source, output, conversion work,
+  and mmap buffers, plus enough host RAM for the remaining conversion workload.
+  There is no universal disk, RAM, or VRAM minimum.
 
-Apply the bundled patch from the ExLlamaV3 project root:
+Conversion requires Linux. Python helper tests also run on macOS and Windows;
+shell checks require Bash. The inference probe uses the first visible CUDA GPU.
+This project is a separate helper for ExLlamaV3.
+
+## Setup
+
+Use a dedicated ExLlamaV3 checkout so unrelated changes do not interfere with
+the wrapper's revision checks.
+
+### 1. Clone both repositories
 
 ```sh
-git checkout be57335b087e4f001c5caae061544df3c06ba01e
-git apply github/patches/exllamav3-low-memory-quantization.patch
+git clone https://github.com/bayanisms/EXL3SSDConvert.git
+cd EXL3SSDConvert
+export EXL3_CONVERT_ROOT="$PWD"
+
+git clone https://github.com/turboderp-org/exllamav3.git ../exllamav3
+export EXLLAMAV3_ROOT="$(cd ../exllamav3 && pwd)"
+git -C "$EXLLAMAV3_ROOT" checkout be57335b087e4f001c5caae061544df3c06ba01e
 ```
 
-If it is already applied, this must pass:
+Keep `EXLLAMAV3_ROOT` exported in the shell used for conversion. If it is unset,
+the wrapper searches this repository's parent directory, which is different
+from the sibling checkout shown here.
+
+### 2. Prepare the Python environment
+
+From the EXL3SSDConvert directory:
 
 ```sh
-git apply --reverse --check github/patches/exllamav3-low-memory-quantization.patch
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip "setuptools>=77" wheel ninja
 ```
 
-Without an explicit expert override, the wrapper also requires that the tracked diff exactly equals the bundled patch and that no other tracked or untracked converter files alter the pinned checkout. `ALLOW_DIFFERENT_EXLLAMAV3=1` disables exact revision/tree verification but still requires the low-memory patch to be present; results from that mode are not controlled reproductions.
+Install a CUDA-enabled PyTorch build using the
+[official PyTorch selector](https://pytorch.org/get-started/locally/), choosing
+versions compatible with your GPU, driver, CUDA toolkit, and the pinned
+ExLlamaV3 requirements. Run the selected installation command inside this
+environment before continuing.
 
-## Run a conversion
-
-Choose three non-overlapping model paths plus a recipe. Source, work, and output must not be equal, nested inside one another, or ancestor paths of one another. The work and output paths must not already exist:
+### 3. Apply the patch and install ExLlamaV3
 
 ```sh
-SOURCE=/models/source-model
-WORK=/fast-disk/model-exl3-work
-OUT=/models/model-exl3
-RECIPE=/path/to/model-recipe.yaml
+git -C "$EXLLAMAV3_ROOT" apply --check \
+  "$EXL3_CONVERT_ROOT/patches/exllamav3-low-memory-quantization.patch"
+git -C "$EXLLAMAV3_ROOT" apply \
+  "$EXL3_CONVERT_ROOT/patches/exllamav3-low-memory-quantization.patch"
+
+python -m pip install --no-build-isolation -e "$EXLLAMAV3_ROOT"
 ```
 
-Run with bounded host memory. The example limits are not universal; increase them only when the machine has enough RAM:
+If the patch is already applied, skip the two forward-application commands.
+Check the installed environment and patch:
+
+```sh
+git -C "$EXLLAMAV3_ROOT" apply --reverse --check \
+  "$EXL3_CONVERT_ROOT/patches/exllamav3-low-memory-quantization.patch"
+python -c 'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"; print(torch.__version__, torch.version.cuda)'
+python -c 'import exllamav3; print(exllamav3.__file__)'
+```
+
+The wrapper requires the pinned commit plus exactly the bundled tracked patch.
+Other tracked changes and untracked files under the converter's runtime paths
+are rejected. Avoid modifying the upstream checkout while a conversion runs.
+
+## Convert a model
+
+Set these paths for your own source model and recipe. **Work and output must
+not exist.** Source, work, and output cannot be equal or nested within one
+another.
+
+```sh
+SOURCE=/absolute/path/to/source-model
+WORK="$EXL3_CONVERT_ROOT/work/model-exl3"
+OUT="$EXL3_CONVERT_ROOT/output/model-exl3"
+RECIPE=/absolute/path/to/your-recipe.yaml
+
+PYTHON_BIN="$(command -v python)" \
+  bash "$EXL3_CONVERT_ROOT/scripts/convert_model_exl3_low_memory.sh" \
+  "$SOURCE" "$WORK" "$OUT" "$RECIPE"
+```
+
+For a new shell, reactivate the virtual environment and export the two checkout
+paths again. The wrapper prints the selected paths before starting.
+
+A zero exit status means the converter completed and the wrapper verified that
+the output config and index parse and every indexed shard is present and
+non-empty. It does not verify model quality or inference.
+
+| Output | Contents |
+|---|---|
+| `$OUT/` | Converted model package |
+| `$OUT.conversion.log` | Converter output and GNU time resource statistics |
+| `$OUT.conversion.exitcode` | Recorded result of the conversion/output-validation stage |
+| `$WORK/` | Conversion intermediates and default mmap directory |
+
+Early input or environment failures can occur before log and exit-code files
+are created. Retain the work directory when diagnosing a failure. The wrapper
+does not expose a resume option; upstream checkpoint/resume behavior is
+documented in the
+[pinned conversion guide](https://github.com/turboderp-org/exllamav3/blob/be57335b087e4f001c5caae061544df3c06ba01e/doc/convert.md).
+
+### Optional: enforce host-memory limits
+
+On a machine with user systemd services, this example bounds host RAM and swap.
+Choose limits for your hardware; these values are starting examples, not model
+requirements. Passing the Python path explicitly keeps the service in the
+same environment as the interactive shell.
 
 ```sh
 systemd-run --user --wait --collect \
@@ -57,97 +161,145 @@ systemd-run --user --wait --collect \
   --property=MemoryHigh=22G \
   --property=MemoryMax=24G \
   --property=MemorySwapMax=4G \
-  /bin/bash "$PWD/github/scripts/convert_model_exl3_low_memory.sh" \
+  --setenv="EXLLAMAV3_ROOT=$EXLLAMAV3_ROOT" \
+  --setenv="PYTHON_BIN=$(command -v python)" \
+  /bin/bash "$EXL3_CONVERT_ROOT/scripts/convert_model_exl3_low_memory.sh" \
   "$SOURCE" "$WORK" "$OUT" "$RECIPE"
 ```
 
-By default, `HEAD_BITS` comes from the recipe (or ExLlamaV3's default), `MTP_BITS` uses ExLlamaV3's default of 4, and `VISION_BITS` uses the architecture default. The wrapper also defaults to:
+Direct execution does not impose these limits. For additional settings under
+`systemd-run`, pass each variable with `--setenv=NAME=value`.
 
-```text
-CODEBOOK=mul1
-DEVICES=0
-EXL3_QUANT_MMAP_THRESHOLD=1073741824
-```
+## Validate the result
 
-Override a setting through the environment when the target model requires it. For example:
+Run a short prefill/decode probe in a fresh Python process:
 
 ```sh
-HEAD_BITS=6 MTP_BITS=4 VISION_BITS=6 DEVICES=0 \
-  /bin/bash github/scripts/convert_model_exl3_low_memory.sh \
-  "$SOURCE" "$WORK" "$OUT" "$RECIPE"
-```
-
-The wrapper verifies the supported Git revision and patch, writes `<OUT>.conversion.log` and `<OUT>.conversion.exitcode`, and returns success only when the output config and index parse and every indexed shard exists and is non-empty. Direct execution works without systemd, but then `MemoryHigh=22G`, `MemoryMax=24G`, and `MemorySwapMax=4G` are not enforced.
-
-## Validate the output
-
-A successful conversion or model load alone does not prove inference works. Stop after a failed gate:
-
-1. Validate the packaged config, index, and shards.
-2. Load the model in a fresh process.
-3. Run a short-context prefill and decode.
-4. Allocate cache at progressively larger contexts.
-5. Execute progressively larger prefills.
-6. At the source model's actual native context, run a near-full prefill followed by decode.
-
-Short probe example:
-
-```sh
-EXL3_QC_STAGING=1 python github/tools/exl3_fit_probe.py \
+EXL3_QC_STAGING=1 python "$EXL3_CONVERT_ROOT/tools/exl3_fit_probe.py" \
   --model "$OUT" --context 8192 --k-bits 4 --v-bits 4 \
   --prefill-tokens 256 --decode-tokens 32 --prefill-chunk 2048 --no-mtp \
-  --output-json short-8192.json
+  --output-json "$EXL3_CONVERT_ROOT/reports/short-8192.json"
 ```
 
-Read the native context from the actual source `config.json`; do not assume 262,144 for another model. Repeat the probe in fresh processes, increasing `--context` and `--prefill-tokens` only after the prior gate passes. With `--allocation-only`, the probe exits successfully only if the cache reports initialized. Cache allocation alone is still not an operational-context proof.
+The probe writes a JSON report and returns nonzero on failure. Inspect its
+`status`, `error`, `prefill_success`, `decode_success`, and memory measurements.
 
-## Example: custom Qwen 3.8 27B model
+- `--context` is cache capacity and must be a positive multiple of 256.
+- `--k-bits` and `--v-bits` accept integers from 2 through 8.
+- Prefill, decode, and chunk counts must be positive; prefill plus decode must
+  not exceed context capacity.
+- Adding `--allocation-only` checks cache initialization without the inference
+  workload. The other required arguments must still be supplied.
+- The probe uses logical `cuda:0`. Use `CUDA_VISIBLE_DEVICES` to select a
+  physical GPU when needed. `DEVICES` configures conversion, not this probe.
+- Runtime is trunk-only; `--no-mtp` makes that explicit. It does not load a
+  speculative MTP component.
 
-Only the decoder recipe changed between the two retained conversions. Both kept 6-bit head, 4-bit MTP, 6-bit vision, `mul1`, Q4/Q4 cache, and the same 262,144-token validation workload.
+After each successful run, increase context and prefill sizes in fresh
+processes. Read the native context from the source `config.json`; do not infer
+it from the examples. At that capacity, test a near-full prefill followed by
+decode. Stop at the first failed stage.
 
-| Measured item | 5.0 BPW | 5.125 BPW | Change |
-|---|---:|---:|---:|
-| Achieved decoder BPW | 4.9998 | 5.1250 | +0.1252 |
-| Predicted KLD | 0.003001 | 0.002621 | -12.662% |
-| Package size | 18.236 GiB | 18.591 GiB | +0.355 GiB |
-| Operational peak | 22,415 MiB | 22,735 MiB | +320 MiB |
-| Minimum free VRAM | 1,710 MiB | 1,390 MiB | -320 MiB |
-| Prefill throughput | 410.190 tok/s | 410.027 tok/s | -0.040% |
-| Full-context result | PASS | PASS | unchanged |
+This deterministic synthetic workload checks execution and memory fit. It is
+not a language-quality benchmark or a guarantee for every application workload.
 
-What was achieved:
+## Conversion settings
 
-- Both conversions completed a 261,632-token prefill followed by eight decoded tokens at 262,144-token capacity.
-- The 5.125 BPW conversion completed in 5,129 seconds with 22.089 GiB maximum host RSS under the documented memory guard.
-- The 5.125 BPW artifact contains three shards and 3,080 indexed tensors and retained 1,390 MiB minimum free VRAM on the measured RTX 3090.
-- Moving from 5.0 to 5.125 improved optimizer-predicted KLD with essentially unchanged prefill speed, at the cost of 0.355 GiB package size and 320 MiB operational VRAM.
-- Use 5.125 for the stronger predicted quantization quality; use 5.0 for the extra 320 MiB deployment margin.
+Set these environment variables before invoking the wrapper:
 
-Predicted KLD is an optimizer estimate, not a measured model-quality benchmark. The exact example recipes, measured results, and checksum manifests are under `examples/custom-qwen-3.8-27b/`.
+| Variable | Default / behavior |
+|---|---|
+| `EXLLAMAV3_ROOT` | Upstream checkout; set explicitly |
+| `PYTHON_BIN` | `python`; use the executable from your environment |
+| `DEVICES` | `0`; converter GPU selection |
+| `CODEBOOK` | `mul1`; also accepts `mcg` and `3inst` |
+| `HEAD_BITS` | Omitted unless set; uses converter/recipe behavior |
+| `MTP_BITS` | Omitted unless set; upstream default is 4 |
+| `VISION_BITS` | Omitted unless set; upstream architecture default |
+| `EXL3_QUANT_MMAP_DIR` | `<WORK>/mmap`; choose fast storage |
+| `EXL3_QUANT_MMAP_THRESHOLD` | `1073741824` bytes (1 GiB) |
+| `LOG_PATH` | `<OUT>.conversion.log` |
+| `EXITCODE_PATH` | `<OUT>.conversion.exitcode` |
+| `ALLOW_DIFFERENT_EXLLAMAV3` | `0`; see override behavior below |
 
-The original experimental checkout contained local tracked changes outside the low-memory patch. The manifests identify the retained source and output artifacts, but this bundle does not claim a rerun will be byte-identical. For new conversions, the wrapper uses the stricter controlled state described above: the pinned commit plus exactly the bundled patch.
-
-## Bundle layout
-
-```text
-README.md / readme.me
-patches/exllamav3-low-memory-quantization.patch
-scripts/convert_model_exl3_low_memory.sh
-tools/exl3_fit_probe.py
-tests/
-examples/custom-qwen-3.8-27b/
-  recipes/5.0bpw-hb6.yaml
-  recipes/5.125bpw-hb6.yaml
-  results/measured-results.json
-  results/5.125-output-checksums.sha256
-  source/source-checksums.sha256
-```
-
-Run the offline checks with:
+For example, to request explicit component bitrates:
 
 ```sh
-python -m unittest \
-  github/tests/test_reproduction_bundle.py \
-  github/tests/test_quantize_low_mem.py \
-  github/tests/test_exl3_fit_probe.py
+HEAD_BITS=6 MTP_BITS=4 VISION_BITS=6 \
+  bash "$EXL3_CONVERT_ROOT/scripts/convert_model_exl3_low_memory.sh" \
+  "$SOURCE" "$WORK" "$OUT" "$RECIPE"
 ```
+
+The wrapper accepts bitrate overrides of 1–8 or 16; upstream component
+restrictions still apply.
+`ALLOW_DIFFERENT_EXLLAMAV3=1` bypasses exact revision and tree verification for
+experiments. In a Git checkout, patch verification still runs; outside Git,
+that override also bypasses patch verification. Prefer the pinned setup when
+reproducing a result or reporting a bug.
+
+## Example recipes
+
+**BPW** means bits per weight. The included recipes assign bitrates to 400
+tensors in a custom Qwen 3.8 27B source model:
+
+| Recipe | Target decoder BPW | Head bits |
+|---|---:|---:|
+| [5.0bpw-hb6.yaml](examples/custom-qwen-3.8-27b/recipes/5.0bpw-hb6.yaml) | 5.0 | 6 |
+| [5.125bpw-hb6.yaml](examples/custom-qwen-3.8-27b/recipes/5.125bpw-hb6.yaml) | 5.125 | 6 |
+
+These are configuration examples, not universal presets. The exact custom
+source weights and sensitivity measurements are not distributed here. Matching
+a model-family name alone does not establish recipe compatibility. Generate
+a recipe for your own model using the upstream
+[self-calibration workflow](https://github.com/turboderp-org/exllamav3/blob/be57335b087e4f001c5caae061544df3c06ba01e/doc/optimize.md).
+Recipe generation has separate calibration and memory requirements; this patch
+targets conversion. Predicted KLD in a recipe is an optimizer estimate, not a
+measured quality score.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| `convert.py not found` | Export `EXLLAMAV3_ROOT` to the upstream checkout, not this repository |
+| Revision mismatch, patch failure, or unexpected changes | Use the pinned commit in a dedicated checkout; verify the reverse patch check |
+| `No module named exllamav3` or CUDA unavailable | Activate the intended environment and repeat the setup checks; confirm `PYTHON_BIN` |
+| Existing or overlapping paths | Select new, separate work/output locations; the wrapper does not overwrite or resume them |
+| Host process killed / RAM exhausted | Inspect the log and memory limit; disk-backed buffers do not remove all RAM requirements |
+| CUDA out of memory | Distinguish conversion from inference; reduce the relevant workload/context or use more suitable hardware |
+| Disk full despite few visible mmap files | Mmap files are unlinked while open and can still occupy space; inspect filesystem free space |
+| Converter exits but wrapper fails | Check the reported config, index, or missing/empty shard error before attempting inference |
+
+A slower run can be the cost of storage I/O. Use local fast storage and monitor
+free space throughout conversion. For inference failures, preserve the probe
+JSON and reduce context to find the first failing stage.
+
+## Development and contributing
+
+Install the lightweight test dependency and run discovery from this
+repository's root:
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
+
+Helper and recipe tests do not require a GPU; shell syntax checks require Bash.
+Wrapper integration tests require Linux and GNU tools. Patch-application
+checks use `EXLLAMAV3_ROOT`; quantization tests require PyTorch and an installed,
+patched ExLlamaV3. Unavailable environments are reported as skips.
+
+[Open an issue](https://github.com/bayanisms/EXL3SSDConvert/issues) with the model
+architecture, software revisions, RAM/VRAM and free disk space, the command
+with private paths replaced, and the first relevant error. For changes, explain
+the affected conversion or probe behavior and include the applicable test
+results. Report whether you used the revision override.
+
+Keep weights, work files, credentials, and reports local. The
+[ignore rules](.gitignore) cover common artifacts and the `models/`, `work/`,
+`output/`, `reports/`, and `local/` directories. Review logs and reports before
+sharing: they can contain absolute paths, process details, and generated text.
+
+## License
+
+[MIT](LICENSE). ExLlamaV3 is developed upstream; see its repository for its
+documentation and licensing.
