@@ -1,7 +1,5 @@
 # Low-memory EXL3 model conversion
 
-## Goal
-
 Convert models to EXL3 when the source model or conversion intermediates do not fit in GPU memory. The wrapper combines ExLlamaV3 conversion with disk-backed large temporary buffers, host-memory limits, explicit quantization settings, conversion-result checks, and a fresh-process runtime probe.
 
 This is a general workflow. Recipes remain model-specific because they map exact tensor names to bitrates. The included custom Qwen 3.8 27B model is an example, not the project identity.
