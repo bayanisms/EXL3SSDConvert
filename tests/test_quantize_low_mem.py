@@ -4,14 +4,28 @@ import tempfile
 import unittest
 
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+    torch = None
 
+
+@unittest.skipIf(torch is None, "quantization tests require PyTorch")
 class LowMemoryQuantizationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.quantize = importlib.import_module(
-            "exllamav3.modules.quant.exl3_lib.quantize"
-        )
+        try:
+            cls.quantize = importlib.import_module(
+                "exllamav3.modules.quant.exl3_lib.quantize"
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "exllamav3":
+                raise
+            raise unittest.SkipTest(
+                "quantization tests require an installed, patched ExLlamaV3"
+            ) from exc
 
     def test_mmap_zeros_is_writable_and_leaves_no_named_tempfile(self):
         with tempfile.TemporaryDirectory() as temp_dir:
